@@ -33,15 +33,13 @@ use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, try_join};
+use futures::{try_join, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
-use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
-};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, PARQUET_FIELD_ID_META_KEY};
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -49,7 +47,7 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
-use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+use crate::expr::visitors::bound_predicate_visitor::{visit, BoundPredicateVisitor};
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
@@ -1697,9 +1695,9 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.metadata_size_hint)
                 // Set the page policy first because it updates both column and offset policies.
-                .with_page_index_policy(PageIndexPolicy::from(self.preload_page_index))
-                .with_column_index_policy(PageIndexPolicy::from(self.preload_column_index))
-                .with_offset_index_policy(PageIndexPolicy::from(self.preload_offset_index));
+                .with_page_indexes(self.preload_page_index)
+                .with_column_indexes(self.preload_column_index)
+                .with_offset_indexes(self.preload_offset_index);
             let size = self.meta.size;
             let meta = reader.load_and_finish(self, size).await?;
 
@@ -1750,7 +1748,6 @@ mod tests {
     use roaring::RoaringTreemap;
     use tempfile::TempDir;
 
-    use crate::ErrorKind;
     use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY};
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
@@ -1761,6 +1758,7 @@ mod tests {
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
     };
+    use crate::ErrorKind;
 
     fn table_schema_simple() -> SchemaRef {
         Arc::new(
@@ -2090,19 +2088,25 @@ message schema {
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::String)).into(),
-                ])
+                .with_fields(vec![NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("a", col_a_type.clone(), true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            col_a_type.clone(),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().to_str().unwrap().to_string();
@@ -2287,19 +2291,25 @@ message schema {
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().to_str().unwrap().to_string();
@@ -2489,12 +2499,15 @@ message schema {
         );
 
         // Create Arrow schema for old Parquet file (only has column 'a')
-        let arrow_schema_old = Arc::new(ArrowSchema::new(vec![
-            Field::new("a", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema_old = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         // Write old Parquet file with only column 'a'
         let tmp_dir = TempDir::new().unwrap();
@@ -2596,19 +2609,25 @@ message schema {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         // Step 1: Create data file with 200 rows in 2 row groups
         // Row group 0: rows 0-99 (ids 1-100)
@@ -2790,19 +2809,25 @@ message schema {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         // Step 1: Create data file with 200 rows in 2 row groups
         // Row group 0: rows 0-99 (ids 1-100)
@@ -3012,19 +3037,25 @@ message schema {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]))]));
 
         // Step 1: Create data file with 200 rows in 2 row groups
         // Row group 0: rows 0-99 (ids 1-100)
